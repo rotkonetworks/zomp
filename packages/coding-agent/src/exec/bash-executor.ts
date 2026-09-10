@@ -3,6 +3,7 @@
  *
  * Uses brush-core via native bindings for shell execution.
  */
+import { spawn } from "node:child_process";
 import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
@@ -482,6 +483,101 @@ async function executeUserShellPty(run: {
 	};
 }
 
+/**
+ * Run one command through an external shell binary (`<shell> <args...> <command>`),
+ * streaming merged stdout/stderr into the shared sink. The command text is
+ * handed to the real shell verbatim, so its own syntax — zish feats, zsh/fish
+ * builtins — works without the embedded parser having to understand it.
+ *
+ * The child leads its own process group (`detached`), so a timeout or abort
+ * kills the whole tree instead of orphaning a `para`/`&` fan-out.
+ */
+async function executeExternalShell(run: {
+	shell: string;
+	args: string[];
+	command: string;
+	cwd: string | undefined;
+	env: Record<string, string>;
+	timeoutMs: number | undefined;
+	signal: AbortSignal | undefined;
+	sink: OutputSink;
+	enqueueChunk: (chunk: string) => void;
+	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
+}): Promise<BashResult> {
+	const child = spawn(run.shell, [...run.args, run.command], {
+		cwd: run.cwd,
+		env: run.env,
+		detached: true,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const killTree = (signal: NodeJS.Signals) => {
+		if (child.pid === undefined) return;
+		try {
+			process.kill(-child.pid, signal);
+		} catch {
+			child.kill(signal);
+		}
+	};
+
+	let killReason: "cancelled" | "timeout" | undefined;
+	const kill = (reason: "cancelled" | "timeout") => {
+		if (killReason !== undefined) return;
+		killReason = reason;
+		killTree("SIGKILL");
+	};
+	const onAbort = () => kill("cancelled");
+	if (run.signal?.aborted) kill("cancelled");
+	else run.signal?.addEventListener("abort", onAbort, { once: true });
+
+	const timer = run.timeoutMs === undefined ? undefined : setTimeout(() => kill("timeout"), run.timeoutMs);
+
+	// stdout and stderr are separate pipes; both feed the one sink so the model
+	// sees a single ordered stream, matching the native backend's merged capture.
+	const decoders = [new TextDecoder(), new TextDecoder()];
+	let streamIndex = 0;
+	for (const stream of [child.stdout, child.stderr]) {
+		const decoder = decoders[streamIndex++];
+		stream?.on("data", (chunk: Buffer) => run.enqueueChunk(decoder.decode(chunk, { stream: true })));
+	}
+
+	const exitCode = await new Promise<number | undefined>(resolve => {
+		child.on("error", err => {
+			run.enqueueChunk(`${err.message}\n`);
+			resolve(undefined);
+		});
+		child.on("close", code => resolve(code ?? undefined));
+	});
+	clearTimeout(timer);
+	run.signal?.removeEventListener("abort", onAbort);
+	// Flush a trailing multi-byte sequence left buffered by the streaming decoders.
+	for (const decoder of decoders) run.enqueueChunk(decoder.decode());
+
+	if (killReason === "timeout") {
+		return {
+			exitCode: undefined,
+			cancelled: true,
+			timedOut: true,
+			...(await run.dump(
+				run.timeoutMs === undefined
+					? "Command timed out"
+					: `Command timed out after ${Math.round(run.timeoutMs / 1000)} seconds`,
+			)),
+		};
+	}
+	if (killReason === "cancelled") {
+		return {
+			exitCode: undefined,
+			cancelled: true,
+			...(await run.dump("Command cancelled")),
+		};
+	}
+	return {
+		exitCode,
+		cancelled: false,
+		...(await run.dump()),
+	};
+}
+
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = await Settings.init();
 	const baseShellConfig = settings.getShellConfig();
@@ -510,6 +606,14 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	if (virtualCwd && (usePty || !options?.filesystem)) {
 		throw new Error(`Working directory ${commandCwd} needs the embedded shell with an injected filesystem`);
 	}
+	// One deadline rule for every backend. A positive caller timeout is the
+	// deadline; `0` disables it; unset defaults to 300s. `nativeOwnsTimeout`
+	// marks the native shell as the enforcer — the JS timer is then only a
+	// backstop that must not race the native teardown.
+	const requestedTimeoutMs = options?.timeout;
+	const deadlineTimeoutMs = requestedTimeoutMs === 0 ? undefined : Math.max(1_000, requestedTimeoutMs ?? 300_000);
+	const nativeTimeoutMs = requestedTimeoutMs !== undefined && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined;
+	const nativeOwnsTimeout = nativeTimeoutMs !== undefined;
 	// Fold the repo's direnv/devenv env into the command + env so devenv tools
 	// land on PATH; the caller's explicit `env` still wins. Thread the caller's
 	// signal + timeout so an aborted / short-timeout call can't hang on a cold
@@ -577,7 +681,6 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	}
 
 	if (usePty && ptyRequest) {
-		const requestedMs = options?.timeout;
 		try {
 			return await executeUserShellPty({
 				shell,
@@ -586,7 +689,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				cwd: commandCwd,
 				env: buildUserShellPtyEnv(shellEnv, commandEnv),
 				pty: ptyRequest,
-				timeoutMs: requestedMs === 0 ? undefined : Math.max(1_000, requestedMs ?? 300_000),
+				timeoutMs: deadlineTimeoutMs,
 				signal: options?.signal,
 				sink,
 				graphics,
@@ -597,244 +700,27 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 	}
 
-	const shellOptions = {
-		sessionEnv: shellEnv,
-		snapshotPath: snapshotPath ?? undefined,
-		minimizer,
-	};
-	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
-	const persistentSessionBroken = brokenShellSessions.has(sessionKey);
-	if (persistentSessionBroken) {
-		shellSessions.delete(sessionKey);
-	}
-
-	// A persistent Shell runs one command at a time (the native session is a
-	// mutex-guarded queue and `abort()` kills every in-flight run on it). When
-	// parallel bash calls overlap on the same key, the first one owns the
-	// persistent session; the rest degrade to isolated one-shot shells — the
-	// same path quarantined sessions take.
-	const sessionBusy = shellSessionsInUse.has(sessionKey);
-	let shellSession = persistentSessionBroken || sessionBusy ? undefined : shellSessions.get(sessionKey);
-	if (!shellSession && !persistentSessionBroken && !sessionBusy) {
-		shellSession = new Shell(shellOptions);
-		shellSessions.set(sessionKey, shellSession);
-	}
-	const executionShell = shellSession ?? new Shell(shellOptions);
-	const ownsPersistentSession = shellSession !== undefined;
-	if (ownsPersistentSession) {
-		shellSessionsInUse.add(sessionKey);
-	}
-	const userSignal = options?.signal;
-	const runAbortController = new AbortController();
-	let abortCleanupPromise: Promise<void> | undefined;
-	const abortShell = (): Promise<void> => {
-		abortCleanupPromise ??= executionShell.abort().catch(() => undefined);
-		return abortCleanupPromise;
-	};
-	const abortCurrentExecution = () => {
-		if (!runAbortController.signal.aborted) {
-			runAbortController.abort();
-		}
-		void abortShell();
-	};
-	const abortDeferred = Promise.withResolvers<"abort">();
-	const abortHandler = () => {
-		abortCurrentExecution();
-		abortDeferred.resolve("abort");
-	};
-	if (userSignal) {
-		userSignal.addEventListener("abort", abortHandler, { once: true });
-	}
-
-	let timeoutTimer: NodeJS.Timeout | undefined;
-	const timeoutDeferred = Promise.withResolvers<"timeout">();
-	const requestedTimeoutMs = options?.timeout;
-	const deadlineTimeoutMs = requestedTimeoutMs === 0 ? undefined : Math.max(1_000, requestedTimeoutMs ?? 300_000);
-	const nativeTimeoutMs = requestedTimeoutMs !== undefined && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined;
-	const nativeOwnsTimeout = nativeTimeoutMs !== undefined;
-	if (deadlineTimeoutMs !== undefined) {
-		const fallbackTimeoutMs = nativeOwnsTimeout
-			? deadlineTimeoutMs + NATIVE_TIMEOUT_FALLBACK_GRACE_MS
-			: deadlineTimeoutMs;
-		timeoutTimer = setTimeout(() => {
-			// Explicit timeouts are enforced inside pi-natives via `timeoutMs`.
-			// Give native cancellation time to flush pipeline output and drain the
-			// N-API bridge before this result-only watchdog quarantines the run.
-			if (!nativeOwnsTimeout) {
-				abortCurrentExecution();
-			}
-			timeoutDeferred.resolve("timeout");
-		}, fallbackTimeoutMs);
-	}
-
-	let resetSession = false;
-
-	try {
-		const runPromise = executionShell.run(
-			{
-				command: finalCommand,
-				cwd: commandCwd,
-				env: commandEnv,
-				timeoutMs: nativeTimeoutMs,
-				signal: runAbortController.signal,
-				filesystem: options?.filesystem,
-			},
-			(err, chunk) => {
-				if (!err) {
-					enqueueChunk(chunk);
-				}
-			},
-		);
-
-		const ey = new ExponentialYield();
-		const winner = await ey.race<
-			{ kind: "result"; result: ShellRunResult } | { kind: "timeout" } | { kind: "abort" }
-		>([
-			runPromise.then(result => ({ kind: "result" as const, result })),
-			timeoutDeferred.promise.then(kind => ({ kind })),
-			abortDeferred.promise.then(kind => ({ kind })),
-		]);
-
-		if (winner.kind === "timeout" || winner.kind === "abort") {
-			acceptingChunks = false;
-			const cleanupPromise = abortShell();
-			if (shellSession) {
-				resetSession = true;
-				quarantineShellSession(sessionKey, runPromise, cleanupPromise);
-			} else {
-				void Promise.allSettled([runPromise, cleanupPromise]);
-			}
-			let notice = "Command cancelled";
-			if (winner.kind === "timeout" && deadlineTimeoutMs !== undefined) {
-				const seconds = Math.round(deadlineTimeoutMs / 1000);
-				// With an explicit timeout the native shell owns enforcement and
-				// this JS timer is only a backstop. If it still wins, the native
-				// run never returned — any output is stuck in the undrained pipe,
-				// so this is not a confirmed empty run (#10308).
-				notice = nativeOwnsTimeout
-					? `Command timed out after ${seconds} seconds; the shell backend did not respond, so any output above may be incomplete`
-					: `Command timed out after ${seconds} seconds`;
-			}
-			return {
-				exitCode: undefined,
-				cancelled: true,
-				...(winner.kind === "timeout" ? { timedOut: true } : {}),
-				...(await dump(notice)),
-			};
-		}
-		if (timeoutTimer) {
-			clearTimeout(timeoutTimer);
-			timeoutTimer = undefined;
-		}
-
-		// Handle timeout
-		if (winner.result.timedOut) {
-			const annotation = options?.timeout
-				? `Command timed out after ${Math.round(options.timeout / 1000)} seconds`
-				: "Command timed out";
-			resetSession = true;
-			if (shellSession) {
-				quarantineShellSession(sessionKey, runPromise, abortCleanupPromise);
-			}
-			return {
-				exitCode: undefined,
-				cancelled: true,
-				timedOut: true,
-				...(await dump(annotation)),
-			};
-		}
-
-		// Handle cancellation
-		if (winner.result.cancelled) {
-			resetSession = true;
-			if (shellSession) {
-				quarantineShellSession(sessionKey, runPromise, abortCleanupPromise);
-			}
-			return {
-				exitCode: undefined,
-				cancelled: true,
-				...(await dump("Command cancelled")),
-			};
-		}
-
-		// When the native minimizer rewrote the output, persist the original and
-		// swap the sink's accumulated raw stream for the minimized text with an
-		// `artifact://<id>` footer so the agent can retrieve the raw bytes
-		// losslessly. The minimized text is a lossy summary, so substitute it
-		// only once the original is addressable — a caller that returns no id
-		// (or an unavailable allocator) must keep the raw stream rather than
-		// silently dropping the diagnostics the summary elided.
-		const minimized = winner.result.minimized;
-		if (minimized && minimized.text !== minimized.originalText) {
-			const artifactId = options?.onMinimizedSave
-				? await options.onMinimizedSave(minimized.originalText, {
-						filter: minimized.filter,
-						inputBytes: minimized.inputBytes,
-						outputBytes: minimized.outputBytes,
-					})
-				: undefined;
-			if (artifactId) {
-				// The decoder above already owns image extraction from the streamed
-				// lossless output. Scrub any graphics frames repeated by the native
-				// minimizer without feeding them back into that decoder.
-				const minimizedGraphics = new TerminalGraphicsDecoder();
-				const minimizedText = minimizedGraphics.push(minimized.text) + minimizedGraphics.finish();
-				sink.replace(minimizedText);
-				const sep = minimizedText.endsWith("\n") ? "" : "\n";
-				sink.push(`${sep}[raw output: artifact://${artifactId}]\n`);
-			}
-		}
-
-		// Normal completion
-		return {
-			exitCode: winner.result.exitCode,
-			cancelled: false,
-			workingDir: winner.result.workingDir,
-			...(await dump()),
-		};
-	} catch (err) {
-		resetSession = true;
-		throw err;
-	} finally {
-		await sink.dispose();
-		if (timeoutTimer) {
-			clearTimeout(timeoutTimer);
-		}
-		if (userSignal) {
-			userSignal.removeEventListener("abort", abortHandler);
-		}
-		if (ownsPersistentSession) {
-			shellSessionsInUse.delete(sessionKey);
-			if (resetSession || options?.sessionKey?.includes(":async:")) {
-				// `:async:` keys are per-job (jobId is unique), so the Shell would
-				// otherwise stay in the process-global map forever after completion.
-				shellSessions.delete(sessionKey);
-				// Dropping the only reference to a per-call `:async:` Shell SIGKILLs
-				// any `nohup`/`&` children (kill-on-drop). If the command left a live
-				// background job, retain the Shell so the process survives across
-				// turns; it is reaped once its last job exits and still dies with the
-				// harness. Skip on resetSession (cancel/error) — those tear down.
-				if (!resetSession && shellSession) {
-					await retainShellWithLiveBackgroundJobs(shellSession);
-				}
-			}
-		}
-	}
-}
-
-function buildSessionKey(
-	shell: string,
-	prefix: string | undefined,
-	snapshotPath: string | null,
-	env: Record<string, string>,
-	agentSessionKey?: string,
-	minimizer?: MinimizerOptions,
-): string {
-	const entries = Object.entries(env);
-	entries.sort(([a], [b]) => a.localeCompare(b));
-	const envSerialized = entries.map(([key, value]) => `${key}=${value}`).join("\n");
-	const minimizerSerialized = minimizer ? JSON.stringify(minimizer) : "";
-	return [agentSessionKey ?? "", shell, prefix ?? "", snapshotPath ?? "", envSerialized, minimizerSerialized].join(
-		"\n",
-	);
-}
+	// A shell the embedded bash parser cannot emulate (zish, zsh, fish, dash)
+	// runs as a real subprocess with the whole command text handed to it. Three
+	// cases stay on the native path:
+	//   - an explicit `shellPath` is required, so the default `$SHELL`-derived
+	//     shell keeps the native session (state, minimizer, in-process builtins);
+	//     a custom *bash* path does too, since the embedded shell already is bash.
+	//   - `!` shortcut commands keep the user-shell path, which owns interactive
+	//     startup (zshrc/fish config, PTY) that a bare `-c` spawn would skip.
+	//   - a bare `cd` keeps the persistent shell, so `OLDPWD` and the session
+	//     cwd stay exact instead of being re-derived.
+	const configuredShellPath = settings.get("shellPath");
+	if (
+		configuredShellPath !== undefined &&
+		configuredShellPath === shell &&
+		process.platform !== "win32" &&
+		!bashShell &&
+		!isCmdShell(shell) &&
+		options?.useUserShell !== true &&
+		!isPersistentShellCdCommand(command)
+	) {
+		try {
+			return await executeExternalShell({
+				shell,
+				args,
