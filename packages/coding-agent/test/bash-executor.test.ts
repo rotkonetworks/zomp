@@ -323,6 +323,56 @@ exit 64
 		}
 	});
 
+	it("runs model tool-call commands through the configured non-bash shell", async () => {
+		if (process.platform === "win32") return;
+
+		const shellDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-shellpath-tool-"));
+		const marker = path.join(shellDir, "fake-shell-ran");
+		const fakeShell = path.join(shellDir, "fake-shell");
+		fs.writeFileSync(
+			fakeShell,
+			`#!/bin/sh
+printf '%s\\n' "$*" > ${shellQuote(marker)}
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = "-c" ]; then
+		shift
+		exec /bin/sh -c "$1"
+	fi
+	shift
+done
+exit 64
+`,
+		);
+		fs.chmodSync(fakeShell, 0o755);
+		Settings.instance.set("shellPath", fakeShell);
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell: fakeShell,
+			args: ["-l", "-c"],
+			env: {
+				PATH: Bun.env.PATH ?? "",
+				HOME: tempDir,
+			},
+			prefix: undefined,
+		});
+
+		try {
+			const result = await executeBash("printf 'tool-shell-ok\\n'", {
+				cwd: tempDir,
+				timeout: 5000,
+				sessionKey: "custom-shell-path-tool",
+			});
+
+			expect(result.cancelled).toBe(false);
+			expect(result.exitCode).toBe(0);
+			expect(result.output.trim()).toBe("tool-shell-ok");
+			// The marker proves the command reached the configured shell instead of
+			// being silently parsed by the embedded one — the bug this backend fixes.
+			expect(fs.readFileSync(marker, "utf8")).toContain("-l -c");
+		} finally {
+			removeSyncWithRetries(shellDir);
+		}
+	});
+
 	it("persists cd, bare cd, and cd - when shortcut commands use a non-bash user shell", async () => {
 		if (process.platform === "win32") return;
 
