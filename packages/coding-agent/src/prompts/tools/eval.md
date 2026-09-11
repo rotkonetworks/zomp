@@ -2,6 +2,7 @@ Run one step of code in a persistent kernel. State persists across calls and `ta
 {{#if spawns}}Eval `agent()` children use independent kernels.{{/if}}
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
+{{#if isZish}}Shell-shaped data work (counts, JSONL, file sniffing, per-file stats) belongs in the zish feats on PATH — reach for `cnt`, `jls`, `snf`, `frq`, `pk`, or `feat list` before writing Python for it.{{/if}}
 {{#if spawns}}{{#if eagerDelegation}}Two or more independent items → named `workpool()` + `.push(…)`; poll outside eval with `hub wait` on the pool name. Handles + `wait()` are for dependency-coupled results.{{/if}}{{/if}}
 
 {{#if py}}Top-level `await` works; `asyncio.run(…)` raises error.{{/if}}
@@ -43,12 +44,14 @@ budget → {{#if py}}`budget.total` (ceiling or None), `budget.spent()`, `budget
 {{#if spawns}}
 <dag>
 Acyclic waves of handles:
+
 - **Name nodes.** `h = agent(…)` returns at once; `h.handle` is `agent://<id>`.
 - **Wire edges.** Put an upstream `.wait()` result or `.handle` in the downstream prompt. Bulk: `write("local://<name>.md", …)`.
 - **`wait(hs)`** = wave barrier. Open-ended item streams → `workpool()`.
 - **Isolate failure.** `wait(hs, raise_errors=False)` keeps a failure in its slot; only that subtree degrades.
 - **Acyclic only.** No node waits on its own descendant.
-</dag>
+ </dag>
+
 {{/if}}
 
 <critical>

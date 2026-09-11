@@ -2,6 +2,21 @@ Runs commands in a persistent shell.
 
 Use ONLY for one binary or a short pipeline that computes a fact (`wc -l`, `sort | uniq -c`, `diff`).
 {{#if hasEval}}Inline scripts, heredocs, `$(…)`, complex control flow/quoting, and non-trivial pipelines → `eval`.{{else}}Inline scripts, heredocs, `$(…)`, and complex control flow → a purpose-built tool or checked-in script.{{/if}}
+{{#if isZish}}
+The shell is **zish**, which ships a _feat_ library: one-question commands that
+replace the Python you would otherwise write inline. Reach for a feat before a
+script, and compose them with pipes:
+
+cnt count lines/bytes/words pk first, last, or a line range
+frq frequency table, top-K jls JSONL: count records or extract a key
+snf file sniff: size/lines/type calc float math `$(( ))` cannot do
+para run a command over many inputs, N at a time
+
+`feat list` prints every installed feat with its one-line usage; `gf install
+<name>` adds one. When bash lacks an operation, extend the shell with a feat
+instead of writing a throwaway script — the cost is paid once, and every later
+turn reuses it.
+{{/if}}
 
 <instruction>
 - Set `cwd` instead of `cd`; use `env: { NAME: "…" }` for multiline/quote-heavy values.

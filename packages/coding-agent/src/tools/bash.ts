@@ -11,7 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
+import { isPosixShell, isZishShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -700,6 +700,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			hasLaunch: isToolActive("hub", this.session.settings.get("launch.enabled")),
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
+			isZish: isZishShell(this.session.settings.getShellConfig().shell),
 			isWindows: process.platform === "win32",
 		});
 	}

@@ -8,6 +8,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { isZishShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -176,6 +177,8 @@ export interface EvalToolDescriptionOptions {
 	evalTools?: boolean;
 	/** Push `workpool()` as the default for independent items (model delegation bias `eager`). Default: true. */
 	eagerDelegation?: boolean;
+	/** Point shell-shaped data work at the zish feat library instead of an inline script. */
+	isZish?: boolean;
 	/** Enabled capability documentation appended to the eval-only prompt. */
 	preludeDocumentation?: string;
 }
@@ -189,6 +192,7 @@ export function getEvalToolDescription(options: EvalToolDescriptionOptions = {})
 		js,
 		evalTools: options.evalTools ?? true,
 		eagerDelegation: options.eagerDelegation ?? true,
+		isZish: options.isZish ?? false,
 		autoBackgroundEnabled: options.autoBackgroundEnabled ?? false,
 		spawns: spawnPolicy.enabled,
 		spawnDefaultAgent: spawnPolicy.defaultAgent,
@@ -299,6 +303,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				autoBackgroundEnabled: this.session.settings.get("eval.autoBackground.enabled"),
 				evalTools: this.session.settings.get("eval.tools.enabled"),
 				eagerDelegation: sessionDelegationBias(this.session) === "eager",
+				isZish: isZishShell(this.session.settings.getShellConfig().shell),
 				preludeDocumentation,
 			});
 		}

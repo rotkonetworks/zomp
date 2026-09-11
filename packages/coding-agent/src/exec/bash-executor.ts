@@ -8,7 +8,7 @@ import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type MinimizerOptions, PtySession, Shell, type ShellRunResult } from "@oh-my-pi/pi-natives";
 import { $env } from "@oh-my-pi/pi-utils/env";
-import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
+import { isCmdShell, isExecutable, isZishShell, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -468,7 +468,7 @@ async function executeUserShellPty(run: {
  */
 function resolveZishSandbox(settings: Settings, shell: string): { profile: string; args: string[] } | undefined {
 	const profile = settings.get("bash.zishProfile");
-	if (profile === "none" || !shellBasename(shell).includes("zish")) return undefined;
+	if (profile === "none" || !isZishShell(shell)) return undefined;
 	const allowWrite = settings.get("bash.zishAllowWrite").filter(path => path !== "");
 	const args = ["--profile", profile];
 	if (allowWrite.length > 0) args.push("--allow-write", allowWrite.join(":"));

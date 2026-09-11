@@ -90,6 +90,16 @@ export function isPosixShell(shell: string): boolean {
 }
 
 /**
+ * Whether the shell is zish. Its feat library and `--profile` sandbox are
+ * shell-specific surfaces, so the executor and the tool descriptions key off
+ * this one predicate instead of each matching on the path themselves.
+ */
+export function isZishShell(shell: string): boolean {
+	const basename = shell.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
+	return basename?.includes("zish") ?? false;
+}
+
+/**
  * Get shell prefix for wrapping commands (profilers, strace, etc.).
  */
 function getShellPrefix(): string | undefined {
