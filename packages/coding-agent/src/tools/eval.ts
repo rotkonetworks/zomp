@@ -10,6 +10,7 @@ import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { isZishShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
@@ -211,6 +212,8 @@ export interface EvalToolDescriptionOptions {
 	evalTools?: boolean;
 	/** Push `workpool()` as the default for independent items (model delegation bias `eager`). Default: true. */
 	eagerDelegation?: boolean;
+	/** Point shell-shaped data work at the zish feat library instead of an inline script. */
+	isZish?: boolean;
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic. */
@@ -231,6 +234,7 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		js: options.js ?? true,
 		evalTools: options.evalTools ?? true,
 		eagerDelegation: options.eagerDelegation ?? true,
+		isZish: options.isZish ?? false,
 		waitTool: options.waitTool ?? true,
 		autoBackgroundEnabled: options.autoBackgroundEnabled ?? false,
 		spawns: spawnPolicy.enabled,
@@ -387,6 +391,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoBackgroundEnabled: cfgEvalAutoBackgroundEnabled.get(session.settings),
 			evalTools: cfgEvalToolsEnabled.get(session.settings),
 			eagerDelegation: sessionDelegationBias(session) === "eager",
+			isZish: isZishShell(session.settings.getShellConfig().shell),
 			waitTool: hasWaitTool(session),
 			preludes: getEnabledEvalPreludes(session.getEvalPreludes?.() ?? []),
 			inlineTopics: session.isToolActive?.("read") === false,
