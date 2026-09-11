@@ -4047,6 +4047,29 @@ export const SETTINGS_SCHEMA = {
 				"Max wait for the first `direnv export` (a cold devenv shell can be slow); on timeout the session runs without the direnv env",
 		},
 	},
+	"bash.zishProfile": {
+		type: "enum",
+		values: ["none", "readonly", "workdir"] as const,
+		default: "none",
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "zish Sandbox Profile",
+			description:
+				"Run each command through zish's fail-closed kernel sandbox (Landlock + seccomp), inherited across the whole process tree. `workdir` allows writes only beneath the session directory, `readonly` allows none, `none` disables it. Requires `shellPath` to point at zish",
+		},
+	},
+	"bash.zishAllowWrite": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "zish Extra Writable Paths",
+			description:
+				"Extra writable roots granted to the zish sandbox, ':'-joined into `--allow-write` (e.g. an agent state dir, /tmp). Grants are exact: a root does not extend to its parent. Refused unless `bash.zishProfile` is restrictive",
+		},
+	},
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
 		type: "boolean",
