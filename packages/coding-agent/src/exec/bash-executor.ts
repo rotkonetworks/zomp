@@ -403,8 +403,8 @@ function resolveUserShellConfig(settings: Settings, baseConfig: ShellConfig): Sh
 
 /**
  * Env for the user-shell PTY path: keep the non-interactive guards (pagers,
- * editors, credential prompts) but restore color — the PTY makes stdout a
- * TTY, so TERM/NO_COLOR/CI are all that keep tools monochrome.
+ * editors, credential prompts) but restore color — the PTY makes stdout a TTY,
+ * so TERM/NO_COLOR/CI are all that keep tools monochrome.
  */
 function buildUserShellPtyEnv(
 	shellEnv: Record<string, string>,
@@ -484,6 +484,28 @@ async function executeUserShellPty(run: {
 }
 
 /**
+ * zish's fail-closed sandbox flags for one command, or `undefined` when it is
+ * off or the configured shell is not zish (the flags are zish's, so another
+ * shell must not be handed them). `--allow-write` is refused by zish unless a
+ * restrictive profile is also set, which is why the profile gates the array.
+ */
+function resolveZishSandbox(settings: Settings, shell: string): { profile: string; args: string[] } | undefined {
+	const profile = settings.get("bash.zishProfile");
+	if (profile === "none" || !shellBasename(shell).includes("zish")) return undefined;
+	const allowWrite = settings.get("bash.zishAllowWrite").filter(path => path !== "");
+	const args = ["--profile", profile];
+	if (allowWrite.length > 0) args.push("--allow-write", allowWrite.join(":"));
+	return { profile, args };
+}
+
+/** Place extra shell flags ahead of the `-c` that introduces the command text. */
+function withFlagsBeforeCommand(args: string[], flags: string[]): string[] {
+	const commandIndex = args.indexOf("-c");
+	if (commandIndex === -1) return [...args, ...flags];
+	return [...args.slice(0, commandIndex), ...flags, ...args.slice(commandIndex)];
+}
+
+/**
  * Run one command through an external shell binary (`<shell> <args...> <command>`),
  * streaming merged stdout/stderr into the shared sink. The command text is
  * handed to the real shell verbatim, so its own syntax — zish feats, zsh/fish
@@ -500,15 +522,19 @@ async function executeExternalShell(run: {
 	env: Record<string, string>;
 	timeoutMs: number | undefined;
 	signal: AbortSignal | undefined;
+	sandbox: { profile: string; args: string[] } | undefined;
 	sink: OutputSink;
 	enqueueChunk: (chunk: string) => void;
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
-	const child = spawn(run.shell, [...run.args, run.command], {
+	const commandArgs = withFlagsBeforeCommand(run.args, run.sandbox?.args ?? []);
+	const child = spawn(run.shell, [...commandArgs, run.command], {
 		cwd: run.cwd,
 		env: run.env,
 		detached: true,
-		stdio: ["ignore", "pipe", "pipe"],
+		// fd 3 carries zish's one-record-per-command trace, which is how the
+		// sandbox flag is attested rather than assumed (see below).
+		stdio: run.sandbox ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 	});
 	const killTree = (signal: NodeJS.Signals) => {
 		if (child.pid === undefined) return;
@@ -540,6 +566,16 @@ async function executeExternalShell(run: {
 		stream?.on("data", (chunk: Buffer) => run.enqueueChunk(decoder.decode(chunk, { stream: true })));
 	}
 
+	// zish writes one JSON record per submitted command to fd 3, including the
+	// sandbox it actually applied — collect it so the profile is attested rather
+	// than trusted.
+	let trace = "";
+	if (run.sandbox) {
+		(child.stdio[3] as NodeJS.ReadableStream | null)?.on("data", (chunk: Buffer) => {
+			trace += chunk.toString("utf8");
+		});
+	}
+
 	const exitCode = await new Promise<number | undefined>(resolve => {
 		child.on("error", err => {
 			run.enqueueChunk(`${err.message}\n`);
@@ -551,6 +587,23 @@ async function executeExternalShell(run: {
 	run.signal?.removeEventListener("abort", onAbort);
 	// Flush a trailing multi-byte sequence left buffered by the streaming decoders.
 	for (const decoder of decoders) run.enqueueChunk(decoder.decode());
+
+	if (run.sandbox) {
+		let attested: string | undefined;
+		try {
+			const records = trace.split("\n").filter(line => line !== "");
+			attested = records.length > 0 ? JSON.parse(records[records.length - 1]).sandbox : undefined;
+		} catch {
+			attested = undefined;
+		}
+		// A requested profile that did not apply is a containment failure, and the
+		// shell has already run — so surface it loudly instead of staying silent.
+		if (attested !== run.sandbox.profile) {
+			run.enqueueChunk(
+				`[zish sandbox not attested: requested ${run.sandbox.profile}, trace reported ${attested ?? "nothing"}]\n`,
+			);
+		}
+	}
 
 	if (killReason === "timeout") {
 		return {
@@ -614,113 +667,4 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const deadlineTimeoutMs = requestedTimeoutMs === 0 ? undefined : Math.max(1_000, requestedTimeoutMs ?? 300_000);
 	const nativeTimeoutMs = requestedTimeoutMs !== undefined && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined;
 	const nativeOwnsTimeout = nativeTimeoutMs !== undefined;
-	// Fold the repo's direnv/devenv env into the command + env so devenv tools
-	// land on PATH; the caller's explicit `env` still wins. Thread the caller's
-	// signal + timeout so an aborted / short-timeout call can't hang on a cold
-	// `.envrc` load before the abort listener is installed. The helper applies
-	// the configured shell `prefix` after any `unset -v` it prepends. A URL cwd
-	// has no `.envrc` on the host.
-	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
-		callerEnv: options?.env,
-		signal: options?.signal,
-		timeoutMs: cfgBashDirenvLoadTimeoutMs.get(settings),
-		callerTimeoutMs: options?.timeout,
-		direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
-		commandPrefix: prefix,
-	});
-	const commandEnv = buildNonInteractiveEnv(preflight.env);
-	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
-	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
-	// paths, and the embedded brush shell runs the POSIX line better directly.
-	const finalCommand =
-		options?.useUserShell === true && !bashShell && !isCmdShell(shell) && !runCdInPersistentShell
-			? buildUserShellCommand(shell, args, preflight.command)
-			: preflight.command;
-
-	// Create output sink for truncation and artifact handling
-	const graphics = new TerminalGraphicsDecoder();
-	const sink = new OutputSink({
-		onChunk: usePty ? undefined : options?.onChunk,
-		artifactPath: options?.artifactPath,
-		artifactId: options?.artifactId,
-		headBytes: resolveOutputSinkHeadBytes(settings),
-		maxColumns: resolveOutputMaxColumns(settings),
-		chunkThrottleMs: !usePty && options?.onChunk ? (options.chunkThrottleMs ?? 50) : 0,
-	});
-
-	// sink.push() is synchronous — buffer management, counters, and onChunk
-	// all run inline. File writes (artifact path) are handled asynchronously
-	// inside the sink. No promise chain needed.
-	let acceptingChunks = true;
-	let graphicsFinished = false;
-	let decodedImages: ImageContent[] = [];
-	const enqueueChunk = (chunk: string) => {
-		if (!acceptingChunks) return;
-		const clean = graphics.push(chunk);
-		if (clean) sink.push(clean);
-	};
-	const dump = async (notice?: string): Promise<OutputSummary & { images?: ImageContent[] }> => {
-		if (!graphicsFinished) {
-			graphicsFinished = true;
-			const tail = graphics.finish();
-			if (tail) sink.push(tail);
-			decodedImages = await graphics.images();
-		}
-		return {
-			...(await sink.dump(notice)),
-			...(decodedImages.length > 0 ? { images: decodedImages } : {}),
-		};
-	};
-
-	if (options?.signal?.aborted) {
-		return {
-			exitCode: undefined,
-			cancelled: true,
-			...(await dump("Command cancelled")),
-		};
-	}
-
-	if (usePty && ptyRequest) {
-		try {
-			return await executeUserShellPty({
-				shell,
-				args,
-				command: preflight.command,
-				cwd: commandCwd,
-				env: buildUserShellPtyEnv(shellEnv, commandEnv),
-				pty: ptyRequest,
-				timeoutMs: deadlineTimeoutMs,
-				signal: options?.signal,
-				sink,
-				graphics,
-				dump,
-			});
-		} finally {
-			await sink.dispose();
-		}
-	}
-
-	// A shell the embedded bash parser cannot emulate (zish, zsh, fish, dash)
-	// runs as a real subprocess with the whole command text handed to it. Three
-	// cases stay on the native path:
-	//   - an explicit `shellPath` is required, so the default `$SHELL`-derived
-	//     shell keeps the native session (state, minimizer, in-process builtins);
-	//     a custom *bash* path does too, since the embedded shell already is bash.
-	//   - `!` shortcut commands keep the user-shell path, which owns interactive
-	//     startup (zshrc/fish config, PTY) that a bare `-c` spawn would skip.
-	//   - a bare `cd` keeps the persistent shell, so `OLDPWD` and the session
-	//     cwd stay exact instead of being re-derived.
-	const configuredShellPath = settings.get("shellPath");
-	if (
-		configuredShellPath !== undefined &&
-		configuredShellPath === shell &&
-		process.platform !== "win32" &&
-		!bashShell &&
-		!isCmdShell(shell) &&
-		options?.useUserShell !== true &&
-		!isPersistentShellCdCommand(command)
-	) {
-		try {
-			return await executeExternalShell({
-				shell,
-				args,
+	// Fold the repo's direnv/de
