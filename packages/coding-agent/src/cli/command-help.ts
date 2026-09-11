@@ -128,3 +128,7 @@ export const usageHelp = {
 export const worktreeHelp = {
 	description: "Add, list, or clear git worktrees (clone-first when enabled)",
 } satisfies CommandMetadata;
+
+export const zishHelp = {
+	description: "List, follow, and steer the zish worker sessions running on this machine",
+} satisfies CommandMetadata;

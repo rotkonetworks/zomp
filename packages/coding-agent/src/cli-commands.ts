@@ -219,6 +219,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.worktreeHelp,
 	},
 	{
+		name: "zish",
+		load: () => import("./commands/zish").then(m => m.default),
+		help: commandHelp.zishHelp,
+	},
+	{
 		name: "search",
 		load: () => import("./commands/web-search").then(m => m.default),
 		aliases: ["q"],
