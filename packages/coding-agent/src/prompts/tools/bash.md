@@ -9,11 +9,6 @@ cnt count lines/bytes/words pk first, last, or a line range
 frq frequency table, top-K jls JSONL: count records or extract a key
 snf file sniff: size/lines/type calc float math `$(( ))` cannot do
 para run a command over many inputs, N at a time
-
-`feat list` prints every installed feat with its one-line usage; `gf install
-<name>` adds one. When bash lacks an operation, extend the shell with a feat
-instead of writing a throwaway script — the cost is paid once, and every later
-turn reuses it.
 {{/if}}
 `cwd`, not `cd`; `pty` only interactive.
 Internal URIs work as paths for builtins/coreutils, redirects, globs.
