@@ -1,0 +1,161 @@
+# Keeps this fork's `main` (zomp's commit series) on top of upstream oh-my-pi.
+#
+#   fetch upstream → rebase → resolve conflicts through a model → regenerate
+#   zomp/patches → prove the patch series still reproduces the branch → gate on
+#   typecheck → force-push main.
+#
+# Upstream moves several hundred commits a week, so most runs are a fast
+# fast-forward replay. When a commit does not replay cleanly the run resolves it
+# with the configured OpenRouter model, gates the result, pushes it, and opens
+# an issue: CI runners have no native addon, so behavior tests still have to be
+# run locally with `bun zomp/sync.ts --test`.
+#
+# Fork setup (once):
+#   - Actions: enable workflows (forks start disabled)
+#   - secret  OPENROUTER_API_KEY   — required for conflict resolution
+#   - variable ZOMP_RESOLVE_MODEL  — optional, defaults to deepseek/deepseek-v4.1-flash
+#   - disable the inherited ci.yml / bazel-cache-warm.yml / nix.yml workflows:
+#     they target the upstream self-hosted `omp-kata` runners this fork lacks,
+#     so their jobs would queue forever.
+name: zomp sync
+
+on:
+   schedule:
+      # Nightly; scheduled runs only fire on the default branch of a repo whose
+      # Actions are enabled, and pause after 60 idle days.
+      - cron: "17 4 * * *"
+   workflow_dispatch:
+
+permissions:
+   contents: write
+   issues: write
+
+concurrency:
+   group: zomp-sync
+   cancel-in-progress: false
+
+jobs:
+   sync:
+      # The patch series can be applied to any checkout of upstream; this
+      # workflow must never rewrite oh-my-pi itself.
+      if: github.repository != 'can1357/oh-my-pi'
+      runs-on: ubuntu-22.04
+      timeout-minutes: 60
+      steps:
+         - uses: actions/checkout@v4
+           with:
+              ref: main
+              # A rebase needs the full history and the real upstream ancestors.
+              fetch-depth: 0
+
+         - uses: ./.github/actions/bun-install
+
+         - name: Configure git identity
+           shell: bash
+           run: |
+              git config user.name "zomp sync"
+              git config user.email "zomp-sync@users.noreply.github.com"
+
+         - name: Sync onto upstream
+           shell: bash
+           env:
+              OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+              ZOMP_RESOLVE_MODEL: ${{ vars.ZOMP_RESOLVE_MODEL }}
+           run: |
+              set -o pipefail
+              bun zomp/sync.ts --resolve --check 2>&1 | tee "$RUNNER_TEMP/sync.log"
+
+         - name: Push the rewritten series
+           if: success()
+           shell: bash
+           # --force-with-lease: refuse if main moved under us since checkout.
+           run: git push --force-with-lease origin main
+
+         - name: Publish the patch series
+           if: success()
+           uses: actions/upload-artifact@v4
+           with:
+              name: zomp-patches
+              path: zomp/patches/
+              if-no-files-found: error
+
+         - name: Open or update the follow-up issue
+           if: success()
+           shell: bash
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: |
+              resolved="$(grep -c 'conflict in ' "$RUNNER_TEMP/sync.log" || true)"
+              skipped="$(grep -c '^  skipped: ' "$RUNNER_TEMP/sync.log" || true)"
+              if [ "$resolved" = "0" ] && [ "$skipped" = "0" ]; then
+                echo "clean replay — nothing for a human"
+                exit 0
+              fi
+              {
+                echo "The nightly sync replayed onto upstream and pushed \`main\`."
+                echo
+                if [ "$resolved" != "0" ]; then
+                  echo "**A model resolved $resolved conflict round(s).** CI runners cannot load the native"
+                  echo "addon, so only the typecheck gate ran. Verify on a machine with the toolchain:"
+                  echo
+                  echo '```'
+                  echo "git fetch origin && git checkout -B main origin/main"
+                  echo "bun install && bun zomp/sync.ts --test"
+                  echo '```'
+                  echo
+                  echo "Resolved files:"
+                  echo
+                  echo '```'
+                  grep -E '^\s+✓ ' "$RUNNER_TEMP/sync.log" || true
+                  echo '```'
+                  echo
+                fi
+                if [ "$skipped" != "0" ]; then
+                  echo "**$skipped commit(s) became empty and were skipped** — upstream most likely adopted"
+                  echo "the change. Confirm the fork still needs them:"
+                  echo
+                  echo '```'
+                  grep -E '^  skipped: ' "$RUNNER_TEMP/sync.log" || true
+                  echo '```'
+                  echo
+                fi
+                echo "Full log: [\`$GITHUB_RUN_ID\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+              } > "$RUNNER_TEMP/issue.md"
+              title="zomp sync: needs attention"
+              existing="$(gh issue list --state open --limit 100 --json number,title \
+                --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)"
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue.md"
+              else
+                gh issue create --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+              fi
+
+         - name: Open or update the failure issue
+           if: failure()
+           shell: bash
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: |
+              {
+                echo "The nightly sync onto upstream did not land; \`main\` is unchanged."
+                echo
+                echo "Reproduce and finish it locally:"
+                echo
+                echo '```'
+                echo "git fetch upstream && bun zomp/sync.ts --check   # or: --resolve --check"
+                echo '```'
+                echo
+                echo '```'
+                tail -n 120 "$RUNNER_TEMP/sync.log" 2>/dev/null || echo "(no log)"
+                echo '```'
+                echo
+                echo "Full log: [\`$GITHUB_RUN_ID\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+              } > "$RUNNER_TEMP/issue.md"
+              title="zomp sync: needs attention"
+              existing="$(gh issue list --state open --limit 100 --json number,title \
+                --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)"
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue.md"
+              else
+                gh issue create --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+              fi
