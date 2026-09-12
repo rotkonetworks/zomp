@@ -27,9 +27,14 @@ optdepends=('zish: kernel-enforced (Landlock+seccomp) sandbox for the external-s
             'python: persistent Python eval cells')
 provides=('omp' 'oh-my-pi')
 conflicts=('omp' 'oh-my-pi' 'oh-my-pi-git' 'oh-my-pi-bin')
-# The artifact is a Bun single-file executable: stripping or debug-splitting it
-# corrupts the embedded runtime.
-options=('!strip' '!debug')
+# !lto is required, not cosmetic: makepkg appends LTOFLAGS (-flto=auto) to
+# CFLAGS/LDFLAGS, and GCC's LTO at link time drops the C dependencies of the
+# bundled pi_natives addon (oniguruma, PCRE2, tree-sitter) from the cdylib. The
+# addon then loads with `undefined symbol: ts_node_is_missing` and every command
+# that touches natives — the bash tool included — dies. The artifact is a Bun
+# single-file executable: stripping or debug-splitting it corrupts the embedded
+# runtime.
+options=('!lto' '!strip' '!debug')
 source=("$pkgname::git+https://github.com/rotkonetworks/zomp.git")
 sha256sums=('SKIP')
 
