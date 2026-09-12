@@ -2,7 +2,7 @@ Run one step of code in a persistent kernel. State persists across calls and `ta
 {{#if spawns}}Eval `agent()` children use independent kernels.{{/if}}
 
 Work incrementally: imports → define → test → use, each its own cell. Re-run setup ONLY after `reset`, kernel crash.
-{{#if isZish}}Shell-shaped data work (counts, JSONL, file sniffing, per-file stats) belongs in the zish feats on PATH — reach for `cnt`, `jls`, `snf`, `frq`, `pk`, or `feat list` before writing Python for it.{{/if}}
+{{#if isZish}}Shell-shaped data work (counts, JSONL, file sniffing, per-file stats) belongs in the zish feats on PATH — reach for `cnt`, `jls`, `snf`, `frq`, or `pk` before writing Python for it.{{/if}}
 {{#if spawns}}{{#if eagerDelegation}}Two or more independent items → named `workpool()` + `.push(…)`; poll outside eval with `hub wait` on the pool name. Handles + `wait()` are for dependency-coupled results.{{/if}}{{/if}}
 
 {{#if py}}Top-level `await` works; `asyncio.run(…)` raises error.{{/if}}
