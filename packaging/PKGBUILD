@@ -1,0 +1,82 @@
+# Maintainer: Rotko Networks <hq@rotko.net>
+#
+# Canonical, in-repo source of truth for the AUR package. The workflow at
+# .github/workflows/aur.yml copies this file into the AUR repo whenever it
+# changes on main. Do not hand-edit the AUR copy.
+#
+# zomp is a rolling fork: main is a rebased commit series on top of upstream
+# oh-my-pi, so this is a -git package. pkgver() reads the checkout, which means
+# upstream moving — or the series being rewritten under it — never needs a new
+# release here.
+pkgname=zomp-git
+pkgver=v18.1.18.r6.g5067fdc
+pkgrel=1
+pkgdesc="Fork of oh-my-pi (omp) that runs tool calls through zish's kernel sandbox (git build)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/rotkonetworks/zomp"
+license=('MIT')
+# gcc-libs: the bundled pi_natives addon links libstdc++/libgcc at runtime.
+depends=('glibc' 'gcc-libs')
+# rustup (not rust): rust-toolchain.toml pins nightly-2026-08-08, and rustup is
+# what honors it. cmake/make build the C dependencies of pi_natives.
+makedepends=('git' 'bun' 'rustup' 'cmake' 'make')
+optdepends=('zish: kernel-enforced (Landlock+seccomp) sandbox for the external-shell backend'
+            'chromium: browser tool (headless web automation)'
+            'python: persistent Python eval cells')
+provides=('omp' 'oh-my-pi')
+conflicts=('omp' 'oh-my-pi' 'oh-my-pi-git' 'oh-my-pi-bin')
+# The artifact is a Bun single-file executable: stripping or debug-splitting it
+# corrupts the embedded runtime.
+options=('!strip' '!debug')
+source=("$pkgname::git+https://github.com/rotkonetworks/zomp.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$pkgname"
+    local version tag
+    version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        packages/coding-agent/package.json | head -n1)"
+    if tag="$(git describe --tags --abbrev=0 2>/dev/null)"; then
+        printf 'v%s.r%s.g%s' "$version" "$(git rev-list --count "$tag"..HEAD)" "$(git rev-parse --short=7 HEAD)"
+    else
+        printf 'v%s.g%s' "$version" "$(git rev-parse --short=7 HEAD)"
+    fi
+}
+
+build() {
+    cd "$pkgname"
+    bun install --frozen-lockfile
+
+    # pi_natives addon through napi + cargo (profile `local` — the release
+    # profile's fat LTO buys nothing for a binary that is embedded next).
+    bun run build:native
+
+    # Compiles src/cli.ts into a single-file executable with the addon and the
+    # generated tool views embedded; writes packages/coding-agent/dist/omp.
+    bun --cwd=packages/coding-agent run build
+}
+
+# No check(): upstream's test suite drives the full agent (natives, PTY, network)
+# and is run in CI; packaging should not gate a user's install on it. The build
+# itself already fails on a broken checkout.
+
+package() {
+    cd "$pkgname"
+    local _omp="$pkgdir/usr/bin/omp"
+    install -Dm755 packages/coding-agent/dist/omp "$_omp"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Shell completions generated from the live CLI metadata. The Bun binary
+    # needs a writable HOME for its extraction cache.
+    export HOME="$srcdir/.omp-home"
+    install -dm755 "$HOME"
+    install -dm755 "$pkgdir/usr/share/bash-completion/completions"
+    "$_omp" completions bash > "$pkgdir/usr/share/bash-completion/completions/omp" 2>/dev/null \
+        || rm -f "$pkgdir/usr/share/bash-completion/completions/omp"
+    install -dm755 "$pkgdir/usr/share/zsh/site-functions"
+    "$_omp" completions zsh > "$pkgdir/usr/share/zsh/site-functions/_omp" 2>/dev/null \
+        || rm -f "$pkgdir/usr/share/zsh/site-functions/_omp"
+    install -dm755 "$pkgdir/usr/share/fish/vendor_completions.d"
+    "$_omp" completions fish > "$pkgdir/usr/share/fish/vendor_completions.d/omp.fish" 2>/dev/null \
+        || rm -f "$pkgdir/usr/share/fish/vendor_completions.d/omp.fish"
+}
