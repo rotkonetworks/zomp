@@ -18,6 +18,9 @@ const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL = process.env.ZOMP_RESOLVE_MODEL || "deepseek/deepseek-v4.1-flash";
 const MAX_ROUNDS = 32;
 const MAX_FILE_BYTES = 512 * 1024;
+const MAX_ATTEMPTS = 4;
+/** Ceiling for one completion — reasoning and the merged file both live here. */
+const MAX_TOKENS = 65_536;
 
 /** Machine-owned files: never hand a conflict in one of these to a model. */
 const NEVER_RESOLVE = [
@@ -35,7 +38,7 @@ export interface ResolutionReport {
 }
 
 interface Completion {
-	choices?: Array<{ message?: { content?: string } }>;
+	choices?: Array<{ message?: { content?: string | null }; finish_reason?: string }>;
 	error?: { message?: string };
 }
 
@@ -57,14 +60,19 @@ async function complete(system: string, user: string, maxTokens: number): Promis
 	const key = process.env.OPENROUTER_API_KEY;
 	if (!key) fail("OPENROUTER_API_KEY is unset — cannot resolve conflicts automatically");
 	let lastError = "no attempt made";
-	for (let attempt = 1; attempt <= 3; attempt++) {
+	// The budget tracks the file, which assumes the model spends it on the
+	// reply. Reasoning models spend part of it thinking, so a truncating reply
+	// (`content: null`, `finish_reason: "length"`) gets another, larger attempt
+	// instead of being reported as an empty completion.
+	let budget = maxTokens;
+	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		const response = await fetch(ENDPOINT, {
 			method: "POST",
 			headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
 			body: JSON.stringify({
 				model: MODEL,
 				temperature: 0,
-				max_tokens: maxTokens,
+				max_tokens: budget,
 				messages: [
 					{ role: "system", content: system },
 					{ role: "user", content: user },
@@ -83,8 +91,14 @@ async function complete(system: string, user: string, maxTokens: number): Promis
 			continue;
 		}
 		const payload = (await response.json()) as Completion;
-		const content = payload.choices?.[0]?.message?.content ?? "";
+		const choice = payload.choices?.[0];
+		const content = choice?.message?.content ?? "";
 		if (content.trim() !== "") return content;
+		if (choice?.finish_reason === "length" && budget < MAX_TOKENS) {
+			lastError = `reply truncated at max_tokens=${budget} — reasoning consumed the budget`;
+			budget = Math.min(MAX_TOKENS, budget * 2);
+			continue;
+		}
 		lastError = payload.error?.message ?? "empty completion";
 		await Bun.sleep(attempt * 5_000);
 	}
